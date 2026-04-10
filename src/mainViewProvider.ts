@@ -50,9 +50,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             const commits = await this._git.getFileCommits(filePath);
             const notes = this._notes!.load();
             const enriched = this._notes!.enrichCommits(commits, notes);
+            const relPath = path.relative(this._repoRoot!, filePath);
             this._send({
                 type: 'fileCommits',
                 fileName: path.basename(filePath),
+                filePath: relPath,
                 commits: this._toWebviewCommits(enriched)
             });
         } catch (e) {
@@ -193,6 +195,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
             case 'removeImage': {
                 this._notes?.removeImage(msg.hash as string, msg.imageName as string);
+                break;
+            }
+
+            case 'removeAudio': {
+                this._notes?.removeAudio(msg.hash as string, msg.audioName as string);
                 break;
             }
 
@@ -976,6 +983,24 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     white-space: nowrap;
     flex-shrink: 0;
   }
+  .ap-del {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s;
+    color: var(--vscode-descriptionForeground);
+  }
+  .ap-row:hover .ap-del { opacity: 1; }
+  .ap-del:hover { background: var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.2)); color: #e05252; }
 
   /* ── Recording panel (fixed top overlay, just below tabs ~36px) ── */
   .rec-panel {
@@ -1203,6 +1228,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   let ctxHash = null;          // commit targeted by last right-click
   let imagesOpen = new Set();  // hashes with image strip expanded
   let audiosOpen = new Set();  // hashes with audio player expanded
+  let currentFilePath = null;  // relative path of the file shown in file tab
+  let pendingAutoOpen = null;  // hash waiting for files to load before auto-opening diff
 
   // ── Recording state ──────────────────────────────────────────────────────────
   let recHash = null;
@@ -1468,6 +1495,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       case 'fileCommits':
         fileCommits = msg.commits;
         fileTabLabel.textContent = msg.fileName;
+        currentFilePath = msg.filePath || null;
+        pendingAutoOpen = null;
         syncNotes(fileCommits);
         activeTab = 'file';
         renderTabs();
@@ -1477,6 +1506,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         filesCache[msg.hash] = msg.files;
         loadingFiles.delete(msg.hash);
         renderCommits();
+        if (pendingAutoOpen === msg.hash) {
+          pendingAutoOpen = null;
+          autoOpenFileDiff(msg.hash);
+        }
         break;
       case 'compareFiles':
         showCompareResults(msg.hash1, msg.hash2, msg.files);
@@ -1707,9 +1740,26 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
           audio.currentTime = Number(progress.value);
         });
 
+        // Delete button
+        const audioName = typeof aud === 'string' ? aud : aud.name;
+        const delBtn = document.createElement('button');
+        delBtn.className = 'ap-del';
+        delBtn.title = 'Remove recording';
+        delBtn.innerHTML = '<svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor"><line x1="1" y1="1" x2="7" y2="7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="7" y1="1" x2="1" y2="7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          audio.pause();
+          if (notesCache[hash]?.audios) {
+            notesCache[hash].audios = notesCache[hash].audios.filter(a => (typeof a === 'string' ? a : a.name) !== audioName);
+          }
+          vscode.postMessage({ type: 'removeAudio', hash, audioName });
+          renderCommits();
+        });
+
         row.appendChild(playBtn);
         row.appendChild(track);
         row.appendChild(timeEl);
+        row.appendChild(delBtn);
         playerSection.appendChild(row);
       });
       el.appendChild(playerSection);
@@ -1785,9 +1835,26 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       if (!filesCache[hash] && !loadingFiles.has(hash)) {
         loadingFiles.add(hash);
         vscode.postMessage({ type: 'getCommitFiles', hash });
+        // Files not yet loaded — fire diff once they arrive
+        if (activeTab === 'file' && currentFilePath) { pendingAutoOpen = hash; }
+      } else if (activeTab === 'file' && currentFilePath) {
+        // Files already cached — open diff immediately
+        autoOpenFileDiff(hash);
       }
     }
     renderCommits();
+  }
+
+  function autoOpenFileDiff(hash) {
+    if (!currentFilePath) { return; }
+    const files = filesCache[hash];
+    if (!files) { return; }
+    // Find the entry matching the current file (exact or suffix match)
+    const match = files.find(f => f.path === currentFilePath) ||
+                  files.find(f => currentFilePath.endsWith(f.path) || f.path.endsWith(currentFilePath));
+    if (match) {
+      vscode.postMessage({ type: 'openDiff', hash, filePath: match.path });
+    }
   }
 
   function toggleSelect(hash) {

@@ -94,6 +94,19 @@ export class NotesService {
         return destPath;
     }
 
+    removeAudio(hash: string, audioName: string) {
+        const data = this.load();
+        if (data[hash]?.audios) {
+            data[hash].audios = data[hash].audios!.filter(n => n !== audioName);
+            const audioPath = path.join(this.audiosDir, audioName);
+            if (fs.existsSync(audioPath)) { fs.unlinkSync(audioPath); }
+        }
+        if (!data[hash]?.color && !data[hash]?.images?.length && !data[hash]?.audios?.length) {
+            delete data[hash];
+        }
+        this.save(data);
+    }
+
     addAudio(hash: string, buffer: Buffer, ext: string): string {
         this.ensureDirs();
         const destName = `${hash.substring(0, 7)}-${Date.now()}${ext}`;
