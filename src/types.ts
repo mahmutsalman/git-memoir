@@ -12,10 +12,15 @@ export interface FileChange {
     path: string;
 }
 
+export interface AudioEntry {
+    fileName: string;
+    filePath?: string; // relative repo path; set when recorded from Current File tab
+}
+
 export interface CommitNote {
     color?: string;
     images?: string[]; // filenames inside .vscode/git-notes/images/
-    audios?: string[]; // filenames inside .vscode/git-notes/audio/
+    audios?: AudioEntry[]; // entries inside .vscode/git-notes/audio/
 }
 
 export interface NotesData {

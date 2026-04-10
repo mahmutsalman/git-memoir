@@ -17,6 +17,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     private _recProcess: ChildProcess | null = null;
     private _recTempPath: string | null = null;
     private _recHash: string | null = null;
+    private _recFilePath: string | null = null;
     private _recUsingSox = false;
 
     constructor(
@@ -123,10 +124,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                             vscode.Uri.file(path.join(imagesDir, filename))
                         ).toString()
                     })) : (c.note?.images ?? []),
-                    audios: hasAudios ? c.note.audios.map((filename: string) => ({
-                        name: filename,
+                    audios: hasAudios ? c.note.audios.map((entry: import('./types').AudioEntry) => ({
+                        name: entry.fileName,
+                        filePath: entry.filePath,
                         uri: webview.asWebviewUri(
-                            vscode.Uri.file(path.join(audiosDir, filename))
+                            vscode.Uri.file(path.join(audiosDir, entry.fileName))
                         ).toString()
                     })) : (c.note?.audios ?? [])
                 }
@@ -214,7 +216,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 break;
             }
             case 'startRecording': {
-                await this._startExtensionRecording(msg.hash as string, msg.deviceId as string | undefined);
+                await this._startExtensionRecording(msg.hash as string, msg.deviceId as string | undefined, msg.filePath as string | undefined);
                 break;
             }
             case 'pauseRecording': {
@@ -330,10 +332,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
     // ─── Extension-side audio recording (sox preferred, ffmpeg fallback) ─────────
 
-    private async _startExtensionRecording(hash: string, deviceId?: string) {
+    private async _startExtensionRecording(hash: string, deviceId?: string, filePath?: string) {
         if (this._recProcess) { return; }
 
         this._recHash = hash;
+        this._recFilePath = filePath || null;
         this._recTempPath = path.join(os.tmpdir(), `git-memoir-${Date.now()}.wav`);
         const platform = os.platform();
 
@@ -453,8 +456,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
 
         if (this._notes) {
-            const destPath = this._notes.addAudio(hash, buffer, '.wav');
-            this._sendAudioSaved(hash, destPath);
+            const filePath = this._recFilePath ?? undefined;
+            const destPath = this._notes.addAudio(hash, buffer, '.wav', filePath);
+            this._sendAudioSaved(hash, destPath, filePath);
         }
     }
 
@@ -471,14 +475,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         this._recProcess = null;
         this._recTempPath = null;
         this._recHash = null;
+        this._recFilePath = null;
         this._recUsingSox = false;
     }
 
-    private _sendAudioSaved(hash: string, destPath: string) {
+    private _sendAudioSaved(hash: string, destPath: string, filePath?: string) {
         if (!this._view) { return; }
         const webviewUri = this._view.webview.asWebviewUri(vscode.Uri.file(destPath));
         const audioName = path.basename(destPath);
-        this._send({ type: 'audioSaved', hash, audioName, webviewUri: webviewUri.toString() });
+        this._send({ type: 'audioSaved', hash, audioName, webviewUri: webviewUri.toString(), filePath });
     }
 
     // ─── Utilities ─────────────────────────────────────────────────────────────
@@ -1050,6 +1055,22 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   }
   .ap-row:hover .ap-del { opacity: 1; }
   .ap-del:hover { background: var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.2)); color: #e05252; }
+  .speed-btn {
+    margin-left: auto;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--vscode-descriptionForeground);
+    background: transparent;
+    border: 1px solid rgba(128,128,128,0.35);
+    border-radius: 3px;
+    padding: 2px 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    align-self: center;
+  }
+  .speed-btn:hover { border-color: #2472c8; color: var(--vscode-foreground); }
 
   /* ── Recording panel (fixed top overlay, just below tabs ~36px) ── */
   .rec-panel {
@@ -1181,11 +1202,17 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 <div class="tabs">
   <button class="tab active" id="tabAll">All Commits</button>
   <button class="tab" id="tabFile"><span id="fileTabLabel">Current File</span></button>
+  <button class="speed-btn" id="speedBtn" title="Playback speed — click to cycle">1.5×</button>
 </div>
 <div class="file-toolbar" id="fileToolbar">
   <span class="toggle-label">Expand commits</span>
   <label class="toggle-switch">
     <input type="checkbox" id="autoOpenToggle">
+    <span class="toggle-track"></span>
+  </label>
+  <span class="toggle-label">All recordings</span>
+  <label class="toggle-switch">
+    <input type="checkbox" id="allAudiosToggle">
     <span class="toggle-track"></span>
   </label>
 </div>
@@ -1287,6 +1314,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   let currentFilePath = null;  // relative path of the file shown in file tab
   let pendingAutoOpen = null;  // hash waiting for files to load before auto-opening diff
   let autoOpenDiff = false;    // controlled by the toggle in file tab toolbar
+  let showAllAudios = false;   // when true, file tab shows recordings from all files
+  const speedSteps = [0.5, 0.75, 1, 1.25, 1.5, 2];
+  let playbackSpeed = 1.5;     // global playback speed applied to all audio players
 
   // ── Recording state ──────────────────────────────────────────────────────────
   let recHash = null;
@@ -1300,6 +1330,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   const fileTabLabel = document.getElementById('fileTabLabel');
   const fileToolbar  = document.getElementById('fileToolbar');
   const autoOpenToggle = document.getElementById('autoOpenToggle');
+  const allAudiosToggle = document.getElementById('allAudiosToggle');
+  const speedBtn = document.getElementById('speedBtn');
   const viewMain   = document.getElementById('viewMain');
   const viewCompare = document.getElementById('viewCompare');
   const commitList = document.getElementById('commitList');
@@ -1339,6 +1371,18 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
   autoOpenToggle.addEventListener('change', () => {
     autoOpenDiff = autoOpenToggle.checked;
+  });
+
+  allAudiosToggle.addEventListener('change', () => {
+    showAllAudios = allAudiosToggle.checked;
+    renderCommits();
+  });
+
+  speedBtn.addEventListener('click', () => {
+    const idx = (speedSteps.indexOf(playbackSpeed) + 1) % speedSteps.length;
+    playbackSpeed = speedSteps[idx];
+    speedBtn.textContent = playbackSpeed + '×';
+    document.querySelectorAll('audio').forEach(a => { a.playbackRate = playbackSpeed; });
   });
 
   // ── Compare bar ───────────────────────────────────────────────────────────────
@@ -1453,7 +1497,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     recReadyRow.style.display = 'none';
     recActiveRow.style.display = '';
     recPanel.classList.remove('paused', 'error');
-    vscode.postMessage({ type: 'startRecording', hash: recHash, deviceId: recDeviceSel.value || undefined });
+    vscode.postMessage({ type: 'startRecording', hash: recHash, deviceId: recDeviceSel.value || undefined, filePath: activeTab === 'file' ? currentFilePath : undefined });
   }
 
   function togglePause() {
@@ -1629,7 +1673,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         hideRecPanel();
         if (!notesCache[msg.hash]) { notesCache[msg.hash] = {}; }
         if (!notesCache[msg.hash].audios) { notesCache[msg.hash].audios = []; }
-        notesCache[msg.hash].audios.push({ name: msg.audioName, uri: msg.webviewUri });
+        notesCache[msg.hash].audios.push({ name: msg.audioName, uri: msg.webviewUri, filePath: msg.filePath || undefined });
         renderCommits();
         break;
       case 'error':
@@ -1683,12 +1727,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
     const images = note?.images || [];
     const audios = note?.audios || [];
+    const visibleAudios = (activeTab === 'file' && !showAllAudios && currentFilePath)
+      ? audios.filter(a => !a.filePath || a.filePath === currentFilePath)
+      : audios;
     const badgeStyle = note?.color ? ' style="background:' + note.color + '"' : '';
     const imgBadge = images.length
       ? '<span class="img-badge"' + badgeStyle + ' title="' + images.length + ' image' + (images.length > 1 ? 's' : '') + ' — click to toggle">' + images.length + '</span>'
       : '';
-    const audBadge = audios.length
-      ? '<span class="aud-badge" title="' + audios.length + ' recording' + (audios.length > 1 ? 's' : '') + ' — click to play">' + audios.length + '</span>'
+    const audBadge = visibleAudios.length
+      ? '<span class="aud-badge" title="' + visibleAudios.length + ' recording' + (visibleAudios.length > 1 ? 's' : '') + ' — click to play">' + visibleAudios.length + '</span>'
       : '';
 
     el.innerHTML =
@@ -1711,7 +1758,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     }
 
     // Audio badge toggle
-    if (audios.length) {
+    if (visibleAudios.length) {
       el.querySelector('.aud-badge').addEventListener('click', (e) => {
         e.stopPropagation();
         if (audiosOpen.has(hash)) { audiosOpen.delete(hash); }
@@ -1721,10 +1768,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     }
 
     // Audio player (only when badge is toggled open)
-    if (audios.length && audiosOpen.has(hash)) {
+    if (visibleAudios.length && audiosOpen.has(hash)) {
       const playerSection = document.createElement('div');
       playerSection.className = 'audio-player';
-      audios.forEach((aud, idx) => {
+      visibleAudios.forEach((aud, idx) => {
         const uri = typeof aud === 'string' ? aud : aud.uri;
 
         // Hidden audio element — driven by custom UI
@@ -1803,6 +1850,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
           e.stopPropagation();
           audio.currentTime = Number(progress.value);
         });
+
+        // Apply global playback speed
+        audio.playbackRate = playbackSpeed;
 
         // Delete button
         const audioName = typeof aud === 'string' ? aud : aud.name;

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { NotesData, CommitNote } from './types';
+import { NotesData, CommitNote, AudioEntry } from './types';
 
 export class NotesService {
     private notesDir: string;
@@ -25,7 +25,17 @@ export class NotesService {
         this.ensureDirs();
         if (!fs.existsSync(this.notesFile)) { return {}; }
         try {
-            return JSON.parse(fs.readFileSync(this.notesFile, 'utf8'));
+            const data: NotesData = JSON.parse(fs.readFileSync(this.notesFile, 'utf8'));
+            // Migrate legacy string[] audios → AudioEntry[]
+            for (const hash of Object.keys(data)) {
+                const note = data[hash];
+                if (note.audios) {
+                    note.audios = (note.audios as unknown[]).map(a =>
+                        typeof a === 'string' ? { fileName: a } : a as AudioEntry
+                    );
+                }
+            }
+            return data;
         } catch {
             return {};
         }
@@ -97,7 +107,7 @@ export class NotesService {
     removeAudio(hash: string, audioName: string) {
         const data = this.load();
         if (data[hash]?.audios) {
-            data[hash].audios = data[hash].audios!.filter(n => n !== audioName);
+            data[hash].audios = data[hash].audios!.filter(a => a.fileName !== audioName);
             const audioPath = path.join(this.audiosDir, audioName);
             if (fs.existsSync(audioPath)) { fs.unlinkSync(audioPath); }
         }
@@ -107,7 +117,7 @@ export class NotesService {
         this.save(data);
     }
 
-    addAudio(hash: string, buffer: Buffer, ext: string): string {
+    addAudio(hash: string, buffer: Buffer, ext: string, filePath?: string): string {
         this.ensureDirs();
         const destName = `${hash.substring(0, 7)}-${Date.now()}${ext}`;
         const destPath = path.join(this.audiosDir, destName);
@@ -116,7 +126,9 @@ export class NotesService {
         const data = this.load();
         if (!data[hash]) { data[hash] = {}; }
         if (!data[hash].audios) { data[hash].audios = []; }
-        data[hash].audios!.push(destName);
+        const entry: AudioEntry = { fileName: destName };
+        if (filePath) { entry.filePath = filePath; }
+        data[hash].audios!.push(entry);
         this.save(data);
 
         return destPath;
