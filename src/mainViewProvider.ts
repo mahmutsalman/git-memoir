@@ -1831,6 +1831,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   function toggleExpand(hash) {
     if (expanded.has(hash)) { expanded.delete(hash); }
     else {
+      expanded.clear();
       expanded.add(hash);
       if (!filesCache[hash] && !loadingFiles.has(hash)) {
         loadingFiles.add(hash);
