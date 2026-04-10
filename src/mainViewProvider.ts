@@ -885,14 +885,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 2px;
     min-width: 18px;
     height: 18px;
     font-size: 10px;
     font-weight: 700;
     font-family: var(--vscode-editor-font-family, monospace);
-    color: var(--vscode-badge-foreground, #fff);
-    background: var(--vscode-badge-background, #4d78cc);
+    color: #fff;
+    background: #2472c8;
     border-radius: 9px;
     padding: 0 5px;
     cursor: pointer;
@@ -902,20 +901,80 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     user-select: none;
     letter-spacing: 0;
   }
-  .aud-badge:hover { opacity: 0.8; }
+  .aud-badge:hover { opacity: 0.85; }
 
-  /* ── Audio player section ── */
+  /* ── Custom audio player ── */
   .audio-player {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
     margin-top: 6px;
-    padding: 4px 0 2px;
+    padding: 2px 0;
   }
-  .audio-player audio {
+  .ap-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 8px;
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+    border-radius: 6px;
+    user-select: none;
+  }
+  .ap-play {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #2472c8;
+    border: none;
+    cursor: pointer;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.15s;
+  }
+  .ap-play:hover { background: #1a5faa; }
+  .ap-play svg { display: block; }
+  .ap-track {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .ap-progress {
+    -webkit-appearance: none;
+    appearance: none;
     width: 100%;
-    height: 32px;
-    border-radius: 3px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.3));
+    outline: none;
+    cursor: pointer;
+  }
+  .ap-progress::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #2472c8;
+    cursor: pointer;
+    margin-top: -3.5px;
+  }
+  .ap-progress::-webkit-slider-runnable-track {
+    height: 3px;
+    border-radius: 2px;
+  }
+  .ap-time {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   /* ── Recording panel (fixed top overlay, just below tabs ~36px) ── */
@@ -1532,7 +1591,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       ? '<span class="img-badge"' + badgeStyle + ' title="' + images.length + ' image' + (images.length > 1 ? 's' : '') + ' — click to toggle">' + images.length + '</span>'
       : '';
     const audBadge = audios.length
-      ? '<span class="aud-badge"' + badgeStyle + ' title="' + audios.length + ' recording' + (audios.length > 1 ? 's' : '') + ' — click to play">🎙' + audios.length + '</span>'
+      ? '<span class="aud-badge" title="' + audios.length + ' recording' + (audios.length > 1 ? 's' : '') + ' — click to play">' + audios.length + '</span>'
       : '';
 
     el.innerHTML =
@@ -1568,14 +1627,90 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     if (audios.length && audiosOpen.has(hash)) {
       const playerSection = document.createElement('div');
       playerSection.className = 'audio-player';
-      audios.forEach(aud => {
-        const uri  = typeof aud === 'string' ? aud : aud.uri;
-        const name = typeof aud === 'string' ? aud : aud.name;
-        const audio = document.createElement('audio');
-        audio.controls = true;
-        audio.src = uri;
-        audio.title = name;
-        playerSection.appendChild(audio);
+      audios.forEach((aud, idx) => {
+        const uri = typeof aud === 'string' ? aud : aud.uri;
+
+        // Hidden audio element — driven by custom UI
+        const audio = new Audio(uri);
+
+        // Row
+        const row = document.createElement('div');
+        row.className = 'ap-row';
+
+        // Play/pause button
+        const playBtn = document.createElement('button');
+        playBtn.className = 'ap-play';
+        playBtn.title = 'Play / Pause';
+        const iconPlay = '<svg width="9" height="10" viewBox="0 0 9 10" fill="white"><polygon points="0,0 9,5 0,10"/></svg>';
+        const iconPause = '<svg width="9" height="10" viewBox="0 0 9 10" fill="white"><rect x="0" y="0" width="3" height="10"/><rect x="6" y="0" width="3" height="10"/></svg>';
+        playBtn.innerHTML = iconPlay;
+
+        // Track + progress
+        const track = document.createElement('div');
+        track.className = 'ap-track';
+
+        const progress = document.createElement('input');
+        progress.type = 'range';
+        progress.className = 'ap-progress';
+        progress.min = '0';
+        progress.max = '100';
+        progress.value = '0';
+        progress.step = '0.1';
+
+        track.appendChild(progress);
+
+        // Time display
+        const timeEl = document.createElement('span');
+        timeEl.className = 'ap-time';
+        timeEl.textContent = '0:00 / –:––';
+
+        const fmt = (s) => {
+          if (!isFinite(s)) { return '–:––'; }
+          const m = Math.floor(s / 60);
+          return m + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+        };
+
+        audio.addEventListener('loadedmetadata', () => {
+          timeEl.textContent = '0:00 / ' + fmt(audio.duration);
+          progress.max = String(audio.duration);
+        });
+        audio.addEventListener('timeupdate', () => {
+          if (!progress.matches(':active')) {
+            progress.value = String(audio.currentTime);
+          }
+          timeEl.textContent = fmt(audio.currentTime) + ' / ' + fmt(audio.duration);
+        });
+        audio.addEventListener('ended', () => {
+          playBtn.innerHTML = iconPlay;
+          progress.value = '0';
+          timeEl.textContent = '0:00 / ' + fmt(audio.duration);
+        });
+
+        playBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (audio.paused) {
+            // Pause all other players in this section
+            playerSection.querySelectorAll('.ap-play').forEach((btn, i) => {
+              if (i !== idx) { btn.innerHTML = iconPlay; }
+            });
+            document.querySelectorAll('audio').forEach(a => a.pause());
+            audio.play();
+            playBtn.innerHTML = iconPause;
+          } else {
+            audio.pause();
+            playBtn.innerHTML = iconPlay;
+          }
+        });
+
+        progress.addEventListener('input', (e) => {
+          e.stopPropagation();
+          audio.currentTime = Number(progress.value);
+        });
+
+        row.appendChild(playBtn);
+        row.appendChild(track);
+        row.appendChild(timeEl);
+        playerSection.appendChild(row);
       });
       el.appendChild(playerSection);
     }
