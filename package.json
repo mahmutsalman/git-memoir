@@ -1,0 +1,82 @@
+{
+  "name": "git-memoir",
+  "displayName": "Git Memoir",
+  "description": "Simple git history viewer with color tags and image annotations",
+  "version": "0.1.0",
+  "publisher": "mahmutsalman",
+  "engines": { "vscode": "^1.74.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onView:gitMemoir.mainView"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "git-memoir",
+          "title": "Git Memoir",
+          "icon": "icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "git-memoir": [
+        {
+          "type": "webview",
+          "id": "gitMemoir.mainView",
+          "name": "Git Memoir"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "gitMemoir.showFileHistory",
+        "title": "Show File History (Git Memoir)"
+      },
+      {
+        "command": "gitMemoir.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "gitMemoir.showFileHistory",
+          "when": "explorerResourceIsFile",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "gitMemoir.showFileHistory",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "gitMemoir.refresh",
+          "when": "view == gitMemoir.mainView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^16.0.0",
+    "@types/vscode": "^1.74.0",
+    "@typescript-eslint/eslint-plugin": "^5.0.0",
+    "@typescript-eslint/parser": "^5.0.0",
+    "eslint": "^8.0.0",
+    "ts-loader": "^9.0.0",
+    "typescript": "^4.9.0",
+    "webpack": "^5.0.0",
+    "webpack-cli": "^4.0.0"
+  }
+}
