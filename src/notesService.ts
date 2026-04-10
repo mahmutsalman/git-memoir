@@ -7,14 +7,18 @@ export class NotesService {
     private notesFile: string;
     readonly imagesDir: string;
 
+    readonly audiosDir: string;
+
     constructor(workspaceRoot: string) {
         this.notesDir = path.join(workspaceRoot, '.vscode', 'git-notes');
         this.notesFile = path.join(this.notesDir, 'notes.json');
         this.imagesDir = path.join(this.notesDir, 'images');
+        this.audiosDir = path.join(this.notesDir, 'audio');
     }
 
     private ensureDirs() {
         fs.mkdirSync(this.imagesDir, { recursive: true });
+        fs.mkdirSync(this.audiosDir, { recursive: true });
     }
 
     load(): NotesData {
@@ -85,6 +89,21 @@ export class NotesService {
         if (!data[hash]) { data[hash] = {}; }
         if (!data[hash].images) { data[hash].images = []; }
         data[hash].images!.push(destName);
+        this.save(data);
+
+        return destPath;
+    }
+
+    addAudio(hash: string, buffer: Buffer, ext: string): string {
+        this.ensureDirs();
+        const destName = `${hash.substring(0, 7)}-${Date.now()}${ext}`;
+        const destPath = path.join(this.audiosDir, destName);
+        fs.writeFileSync(destPath, buffer);
+
+        const data = this.load();
+        if (!data[hash]) { data[hash] = {}; }
+        if (!data[hash].audios) { data[hash].audios = []; }
+        data[hash].audios!.push(destName);
         this.save(data);
 
         return destPath;

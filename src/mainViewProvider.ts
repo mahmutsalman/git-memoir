@@ -1,16 +1,23 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
+import { spawn, ChildProcess } from 'child_process';
 import { GitService } from './gitService';
 import { NotesService } from './notesService';
 import { GitMemoirContentProvider } from './diffProvider';
 import { getClipboardImage } from './clipboardService';
+import { findFfmpeg, findSox, listAudioDevices, buildInputArgs, buildSoxArgs } from './audioService';
 
 export class MainViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private _git?: GitService;
     private _notes?: NotesService;
     private _repoRoot?: string;
+    private _recProcess: ChildProcess | null = null;
+    private _recTempPath: string | null = null;
+    private _recHash: string | null = null;
+    private _recUsingSox = false;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -93,24 +100,33 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    // Convert image filenames → webview URIs so both tabs share the same format
+    // Convert image/audio filenames → webview URIs so both tabs share the same format
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private _toWebviewCommits(commits: any[]): any[] {
         if (!this._view || !this._notes) { return commits; }
         const webview = this._view.webview;
         const imagesDir = this._notes.imagesDir;
+        const audiosDir = this._notes.audiosDir;
         return commits.map(c => {
-            if (!c.note?.images?.length) { return c; }
+            const hasImages = c.note?.images?.length;
+            const hasAudios = c.note?.audios?.length;
+            if (!hasImages && !hasAudios) { return c; }
             return {
                 ...c,
                 note: {
                     ...c.note,
-                    images: c.note.images.map((filename: string) => ({
+                    images: hasImages ? c.note.images.map((filename: string) => ({
                         name: filename,
                         uri: webview.asWebviewUri(
                             vscode.Uri.file(path.join(imagesDir, filename))
                         ).toString()
-                    }))
+                    })) : (c.note?.images ?? []),
+                    audios: hasAudios ? c.note.audios.map((filename: string) => ({
+                        name: filename,
+                        uri: webview.asWebviewUri(
+                            vscode.Uri.file(path.join(audiosDir, filename))
+                        ).toString()
+                    })) : (c.note?.audios ?? [])
                 }
             };
         });
@@ -177,6 +193,37 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
             case 'removeImage': {
                 this._notes?.removeImage(msg.hash as string, msg.imageName as string);
+                break;
+            }
+
+            case 'listDevices': {
+                const ffmpeg = await findFfmpeg();
+                if (ffmpeg) {
+                    const devices = await listAudioDevices(ffmpeg);
+                    this._send({ type: 'deviceList', devices });
+                } else {
+                    this._send({ type: 'deviceList', devices: [] });
+                }
+                break;
+            }
+            case 'startRecording': {
+                await this._startExtensionRecording(msg.hash as string, msg.deviceId as string | undefined);
+                break;
+            }
+            case 'pauseRecording': {
+                this._pauseExtensionRecording();
+                break;
+            }
+            case 'resumeRecording': {
+                this._resumeExtensionRecording();
+                break;
+            }
+            case 'stopRecording': {
+                await this._stopExtensionRecording();
+                break;
+            }
+            case 'cancelRecording': {
+                this._cancelExtensionRecording();
                 break;
             }
         }
@@ -274,6 +321,159 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         this._send({ type: 'imageAttached', hash, imageName, webviewUri: webviewUri.toString() });
     }
 
+    // ─── Extension-side audio recording (sox preferred, ffmpeg fallback) ─────────
+
+    private async _startExtensionRecording(hash: string, deviceId?: string) {
+        if (this._recProcess) { return; }
+
+        this._recHash = hash;
+        this._recTempPath = path.join(os.tmpdir(), `git-memoir-${Date.now()}.wav`);
+        const platform = os.platform();
+
+        // Try sox first — uses CoreAudio directly on macOS, no avfoundation buffering artifacts
+        const sox = await findSox();
+        if (sox) {
+            // deviceId on macOS is the device name string (e.g. "MacBook Pro Microphone")
+            // ffmpegId-style indices (":0") are not valid for sox; fall back to 'default'
+            const deviceName = deviceId && !deviceId.startsWith(':') ? deviceId : 'default';
+            const soxArgs = buildSoxArgs(platform, deviceName, this._recTempPath);
+            this._recProcess = spawn(sox, soxArgs, { stdio: ['ignore', 'ignore', 'ignore'] });
+            this._recUsingSox = true;
+        } else {
+            // Fallback to ffmpeg
+            const ffmpeg = await findFfmpeg();
+            if (!ffmpeg) {
+                this._send({ type: 'recordingError', message: 'No recorder found. See the notification for install instructions.' });
+                if (platform === 'win32') {
+                    const choice = await vscode.window.showInformationMessage(
+                        'Git Memoir needs Sox or FFmpeg to record audio.',
+                        { modal: true, detail:
+                            'Option 1 — Sox (recommended):\n' +
+                            '  Download from https://sourceforge.net/projects/sox/\n' +
+                            '  Install it, then reload VS Code.\n\n' +
+                            'Option 2 — FFmpeg:\n' +
+                            '  Download from https://ffmpeg.org/download.html\n' +
+                            '  Add ffmpeg.exe to your PATH, then reload VS Code.\n\n' +
+                            'Pause/resume is only supported with Sox on Windows.'
+                        },
+                        'Get Sox', 'Get FFmpeg'
+                    );
+                    if (choice === 'Get Sox') {
+                        vscode.env.openExternal(vscode.Uri.parse('https://sourceforge.net/projects/sox/'));
+                    } else if (choice === 'Get FFmpeg') {
+                        vscode.env.openExternal(vscode.Uri.parse('https://ffmpeg.org/download.html'));
+                    }
+                } else {
+                    vscode.window.showErrorMessage(
+                        'Git Memoir: No recorder found.',
+                        { modal: false, detail: 'Install sox with: brew install sox' }
+                    );
+                }
+                return;
+            }
+            const id = deviceId ?? (platform === 'darwin' ? ':0' : platform === 'linux' ? 'default' : 'audio=default');
+            const inputArgs = buildInputArgs(platform, id);
+            this._recProcess = spawn(ffmpeg, [
+                '-thread_queue_size', '4096',
+                ...inputArgs,
+                '-ar', '48000', '-ac', '1',
+                '-af', 'highpass=f=120,lowpass=f=3400,anlmdn,acompressor=threshold=-68dB:ratio=3:attack=50:release=500',
+                '-c:a', 'pcm_s16le', '-y',
+                this._recTempPath
+            ], { stdio: ['pipe', 'ignore', 'ignore'] });
+            this._recUsingSox = false;
+        }
+
+        this._recProcess.on('error', (err) => {
+            this._send({ type: 'recordingError', message: err.message });
+            this._cleanupRec();
+        });
+
+        // Wait ~600ms for the recorder to initialise before signalling ready
+        const canPause = os.platform() !== 'win32';
+        setTimeout(() => {
+            if (this._recProcess) {
+                this._send({ type: 'recordingStarted', hash, canPause });
+            }
+        }, 600);
+    }
+
+    private _pauseExtensionRecording() {
+        if (!this._recProcess) { return; }
+        if (os.platform() === 'win32') {
+            // SIGSTOP not supported on Windows — ignore silently
+            return;
+        }
+        try { this._recProcess.kill('SIGSTOP'); } catch { /* ignore */ }
+        this._send({ type: 'recordingPaused' });
+    }
+
+    private _resumeExtensionRecording() {
+        if (!this._recProcess) { return; }
+        if (os.platform() === 'win32') { return; }
+        try { this._recProcess.kill('SIGCONT'); } catch { /* ignore */ }
+        this._send({ type: 'recordingResumed' });
+    }
+
+    private async _stopExtensionRecording() {
+        if (!this._recProcess || !this._recTempPath || !this._recHash) { return; }
+
+        const proc = this._recProcess;
+        const tempPath = this._recTempPath;
+        const hash = this._recHash;
+        const isWindows = os.platform() === 'win32';
+        this._cleanupRec();
+
+        await new Promise<void>((resolve) => {
+            const timeout = setTimeout(() => {
+                try { proc.kill(); } catch { /* ignore */ }
+                resolve();
+            }, 4000);
+            proc.on('close', () => { clearTimeout(timeout); resolve(); });
+            // SIGINT causes sox/ffmpeg to finalize WAV on Unix; on Windows just kill()
+            try {
+                if (isWindows) { proc.kill(); } else { proc.kill('SIGINT'); }
+            } catch { resolve(); }
+        });
+
+        if (!fs.existsSync(tempPath) || fs.statSync(tempPath).size < 100) {
+            this._send({ type: 'recordingError', message: 'No audio captured. Is a microphone connected?' });
+            try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+            return;
+        }
+
+        const buffer = fs.readFileSync(tempPath);
+        try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+
+        if (this._notes) {
+            const destPath = this._notes.addAudio(hash, buffer, '.wav');
+            this._sendAudioSaved(hash, destPath);
+        }
+    }
+
+    private _cancelExtensionRecording() {
+        if (!this._recProcess) { return; }
+        const proc = this._recProcess;
+        const tempPath = this._recTempPath;
+        this._cleanupRec();
+        try { proc.kill(); } catch { /* ignore */ }
+        if (tempPath) { try { fs.unlinkSync(tempPath); } catch { /* ignore */ } }
+    }
+
+    private _cleanupRec() {
+        this._recProcess = null;
+        this._recTempPath = null;
+        this._recHash = null;
+        this._recUsingSox = false;
+    }
+
+    private _sendAudioSaved(hash: string, destPath: string) {
+        if (!this._view) { return; }
+        const webviewUri = this._view.webview.asWebviewUri(vscode.Uri.file(destPath));
+        const audioName = path.basename(destPath);
+        this._send({ type: 'audioSaved', hash, audioName, webviewUri: webviewUri.toString() });
+    }
+
     // ─── Utilities ─────────────────────────────────────────────────────────────
 
     private _send(msg: unknown) {
@@ -296,6 +496,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 <meta http-equiv="Content-Security-Policy"
   content="default-src 'none';
            img-src ${webview.cspSource} data:;
+           media-src ${webview.cspSource} blob:;
            script-src 'nonce-${nonce}';
            style-src 'unsafe-inline';">
 <style>
@@ -446,16 +647,38 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     word-break: break-word;
     transition: color 0.1s;
   }
-  .commit-meta {
-    display: flex;
+  /* ── Image badge (collapsed thumbnail strip indicator) ── */
+  .img-badge {
+    display: inline-flex;
     align-items: center;
-    justify-content: space-between;
-    margin-top: 3px;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--vscode-editor-font-family, monospace);
+    color: var(--vscode-badge-foreground, #fff);
+    background: var(--vscode-badge-background, #4d78cc);
+    border-radius: 9px;
+    padding: 0 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-top: 1px;
+    transition: opacity 0.1s;
+    user-select: none;
+    letter-spacing: 0;
   }
-  .commit-sub {
+  .img-badge:hover { opacity: 0.8; }
+
+  /* ── Context menu date info line ── */
+  .ctx-info {
+    padding: 5px 14px 4px;
     font-size: 11px;
     color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    white-space: nowrap;
   }
+
   /* ── Right-click context menu ── */
   .ctx-menu {
     position: fixed;
@@ -657,6 +880,153 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   .view { display: none; height: 100%; flex-direction: column; }
   .view.active { display: flex; }
 
+  /* ── Audio badge ── */
+  .aud-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-width: 18px;
+    height: 18px;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--vscode-editor-font-family, monospace);
+    color: var(--vscode-badge-foreground, #fff);
+    background: var(--vscode-badge-background, #4d78cc);
+    border-radius: 9px;
+    padding: 0 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-top: 1px;
+    transition: opacity 0.1s;
+    user-select: none;
+    letter-spacing: 0;
+  }
+  .aud-badge:hover { opacity: 0.8; }
+
+  /* ── Audio player section ── */
+  .audio-player {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+    padding: 4px 0 2px;
+  }
+  .audio-player audio {
+    width: 100%;
+    height: 32px;
+    border-radius: 3px;
+  }
+
+  /* ── Recording panel (fixed top overlay, just below tabs ~36px) ── */
+  .rec-panel {
+    position: fixed;
+    top: 36px;
+    left: 0;
+    right: 0;
+    display: none;
+    flex-direction: column;
+    gap: 0;
+    border-bottom: 2px solid var(--vscode-focusBorder);
+    background: color-mix(in srgb, var(--vscode-editor-background) 95%, var(--vscode-focusBorder));
+    z-index: 500;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  }
+  .rec-panel.open { display: flex; }
+
+  /* error state */
+  .rec-panel.error { border-bottom-color: var(--vscode-errorForeground, #f14c4c); }
+
+  .rec-main-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px 6px;
+  }
+  .rec-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #ef4444;
+    animation: rec-blink 1s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .rec-panel.paused .rec-dot { animation: none; background: #f97316; }
+  .rec-panel.error .rec-dot { animation: none; background: var(--vscode-errorForeground, #f14c4c); }
+  @keyframes rec-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.15; }
+  }
+  .rec-label {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+  }
+  .rec-state {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--vscode-foreground);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .rec-hint {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    margin-top: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rec-timer {
+    font-size: 18px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    color: var(--vscode-foreground);
+    letter-spacing: 2px;
+    font-weight: 600;
+    flex-shrink: 0;
+    min-width: 44px;
+    text-align: right;
+  }
+  .rec-ready-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 14px;
+  }
+  .rec-active-row {
+    display: flex;
+    flex-direction: column;
+  }
+  .rec-device-sel {
+    flex: 1;
+    min-width: 0;
+    background: var(--vscode-dropdown-background, var(--vscode-input-background));
+    color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+    border-radius: 3px;
+    font-size: 11px;
+    padding: 4px 6px;
+    cursor: pointer;
+  }
+  .rec-ready-row .btn, .rec-ready-row .btn-ghost {
+    font-size: 11px;
+    padding: 5px 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .rec-controls {
+    display: flex;
+    gap: 5px;
+    padding: 6px 14px 10px;
+  }
+  .rec-controls .btn, .rec-controls .btn-ghost {
+    flex: 1;
+    text-align: center;
+    font-size: 11px;
+    padding: 5px 8px;
+  }
+
   /* ── Image lightbox overlay ── */
   .lightbox {
     display: none;
@@ -701,11 +1071,42 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   <div class="list-area" id="compareList"></div>
 </div>
 
+<!-- ── Recording panel ── -->
+<div class="rec-panel" id="recPanel">
+  <!-- Ready state: pick device then start -->
+  <div class="rec-ready-row" id="recReadyRow">
+    <select class="rec-device-sel" id="recDeviceSel">
+      <option value="">Loading devices…</option>
+    </select>
+    <button class="btn" id="recStartBtn">⏺ Record</button>
+    <button class="btn btn-ghost" id="recCancelBtn">✕</button>
+  </div>
+  <!-- Active state: recording controls -->
+  <div class="rec-active-row" id="recActiveRow" style="display:none">
+    <div class="rec-main-row">
+      <div class="rec-dot"></div>
+      <div class="rec-label">
+        <span class="rec-state" id="recState">Recording</span>
+        <span class="rec-hint" id="recHint"></span>
+      </div>
+      <span class="rec-timer" id="recTimer">0:00</span>
+    </div>
+    <div class="rec-controls">
+      <button class="btn btn-ghost" id="recPauseBtn">⏸ Pause</button>
+      <button class="btn" id="recStopBtn">⏹ Save</button>
+      <button class="btn btn-ghost" id="recAbortBtn">✕ Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Right-click context menu ── -->
 <div class="ctx-menu" id="ctxMenu">
+  <div class="ctx-info" id="ctxDate"></div>
+  <div class="ctx-sep"></div>
   <div class="ctx-item" id="ctxColor"><span class="ctx-icon">🎨</span>Tag Color</div>
   <div class="ctx-item" id="ctxAttach"><span class="ctx-icon">🖼</span>Attach Image…</div>
   <div class="ctx-item" id="ctxPaste"><span class="ctx-icon">📋</span>Paste Image from Clipboard</div>
+  <div class="ctx-item" id="ctxRecord"><span class="ctx-icon">🎙</span>Record Audio</div>
   <div class="ctx-sep"></div>
   <div class="ctx-item" id="ctxSelect"><span class="ctx-icon">✓</span>Select for Compare</div>
 </div>
@@ -737,10 +1138,18 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   let expanded = new Set();
   let loadingFiles = new Set();
   let filesCache = {};
-  let notesCache = {};        // hash → { color?, images: [{name,uri}] }
-  let selected = [];          // max 2 for compare
+  let notesCache = {};         // hash → { color?, images: [{name,uri}], audios: [{name,uri}] }
+  let selected = [];           // max 2 for compare
   let colorTarget = null;
-  let ctxHash = null;         // commit targeted by last right-click
+  let ctxHash = null;          // commit targeted by last right-click
+  let imagesOpen = new Set();  // hashes with image strip expanded
+  let audiosOpen = new Set();  // hashes with audio player expanded
+
+  // ── Recording state ──────────────────────────────────────────────────────────
+  let recHash = null;
+  let recPaused = false;
+  let recTimerInterval = null;
+  let recSeconds = 0;
 
   // ── DOM refs ─────────────────────────────────────────────────────────────────
   const tabAll     = document.getElementById('tabAll');
@@ -758,8 +1167,21 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   const compareHeaderText = document.getElementById('compareHeaderText');
   const colorPopup = document.getElementById('colorPopup');
   const ctxMenu    = document.getElementById('ctxMenu');
+  const ctxDate    = document.getElementById('ctxDate');
   const lightbox   = document.getElementById('lightbox');
   const lightboxImg = document.getElementById('lightboxImg');
+  const recPanel    = document.getElementById('recPanel');
+  const recState    = document.getElementById('recState');
+  const recHint     = document.getElementById('recHint');
+  const recTimer    = document.getElementById('recTimer');
+  const recReadyRow  = document.getElementById('recReadyRow');
+  const recActiveRow = document.getElementById('recActiveRow');
+  const recStartBtn  = document.getElementById('recStartBtn');
+  const recPauseBtn  = document.getElementById('recPauseBtn');
+  const recStopBtn   = document.getElementById('recStopBtn');
+  const recCancelBtn = document.getElementById('recCancelBtn');
+  const recAbortBtn  = document.getElementById('recAbortBtn');
+  const recDeviceSel = document.getElementById('recDeviceSel');
 
   // ── Tabs ─────────────────────────────────────────────────────────────────────
   tabAll.addEventListener('click', () => { activeTab = 'all'; renderTabs(); renderCommits(); });
@@ -789,9 +1211,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ── Context menu ─────────────────────────────────────────────────────────────
-  function openCtxMenu(hash, x, y) {
+  function openCtxMenu(hash, x, y, date) {
     ctxHash = hash;
-    const w = 210, h = 140;
+    ctxDate.textContent = date || '';
+    const w = 210, h = 160;
     ctxMenu.style.left = Math.min(x, window.innerWidth  - w - 6) + 'px';
     ctxMenu.style.top  = Math.min(y, window.innerHeight - h - 6) + 'px';
     ctxMenu.classList.add('open');
@@ -841,6 +1264,95 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     toggleSelect(ctxHash);
     closeAll();
   });
+
+  document.getElementById('ctxRecord').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const hash = ctxHash;
+    closeAll();
+    if (!hash) { return; }
+    startRecording(hash);
+  });
+
+  // ── Recording controls ────────────────────────────────────────────────────────
+  recStartBtn.addEventListener('click',  (e) => { e.stopPropagation(); beginRecording(); });
+  recPauseBtn.addEventListener('click',  (e) => { e.stopPropagation(); togglePause(); });
+  recStopBtn.addEventListener('click',   (e) => { e.stopPropagation(); stopRecording(); });
+  recCancelBtn.addEventListener('click', (e) => { e.stopPropagation(); cancelRecording(); });
+  recAbortBtn.addEventListener('click',  (e) => { e.stopPropagation(); cancelRecording(); });
+
+  function startRecording(hash) {
+    recHash = hash;
+    recPaused = false;
+    recSeconds = 0;
+    recReadyRow.style.display = '';
+    recActiveRow.style.display = 'none';
+    recDeviceSel.innerHTML = '<option value="">Loading devices…</option>';
+    recPanel.classList.remove('paused', 'error');
+    recPanel.classList.add('open');
+    vscode.postMessage({ type: 'listDevices' });
+  }
+
+  function beginRecording() {
+    recPauseBtn.disabled = true;
+    recStopBtn.disabled = true;
+    recPauseBtn.textContent = '⏸ Pause';
+    recState.textContent = 'Starting…';
+    recHint.textContent = 'Initializing microphone';
+    recTimer.textContent = '';
+    recSeconds = 0;
+    recReadyRow.style.display = 'none';
+    recActiveRow.style.display = '';
+    recPanel.classList.remove('paused', 'error');
+    vscode.postMessage({ type: 'startRecording', hash: recHash, deviceId: recDeviceSel.value || undefined });
+  }
+
+  function togglePause() {
+    if (recPaused) {
+      vscode.postMessage({ type: 'resumeRecording' });
+    } else {
+      vscode.postMessage({ type: 'pauseRecording' });
+    }
+  }
+
+  function stopRecording() {
+    stopTimer();
+    recState.textContent = 'Saving…';
+    recHint.textContent = 'Processing audio';
+    recPauseBtn.disabled = true;
+    recStopBtn.disabled = true;
+    vscode.postMessage({ type: 'stopRecording' });
+  }
+
+  function cancelRecording() {
+    stopTimer();
+    // Only send cancel if recording was actually started
+    if (recActiveRow.style.display !== 'none') {
+      vscode.postMessage({ type: 'cancelRecording' });
+    }
+    hideRecPanel();
+  }
+
+  function hideRecPanel() {
+    recPanel.classList.remove('open', 'paused', 'error');
+    recReadyRow.style.display = '';
+    recActiveRow.style.display = 'none';
+    recHash = null;
+    recPaused = false;
+  }
+
+  function startTimer() {
+    recTimerInterval = setInterval(() => {
+      recSeconds++;
+      const m = Math.floor(recSeconds / 60);
+      const s = recSeconds % 60;
+      recTimer.textContent = m + ':' + String(s).padStart(2, '0');
+    }, 1000);
+  }
+
+  function stopTimer() {
+    clearInterval(recTimerInterval);
+    recTimerInterval = null;
+  }
 
   // ── Color picker ──────────────────────────────────────────────────────────────
   document.querySelectorAll('.color-dot').forEach(dot => {
@@ -916,23 +1428,73 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         notesCache[msg.hash].images.push({ name: msg.imageName, uri: msg.webviewUri });
         renderCommits();
         break;
+      case 'recordingStarted':
+        recPauseBtn.style.display = msg.canPause === false ? 'none' : '';
+        recPauseBtn.disabled = false;
+        recStopBtn.disabled = false;
+        recState.textContent = 'Recording';
+        recHint.textContent = 'Speak now — press Save when done';
+        recTimer.textContent = '0:00';
+        recSeconds = 0;
+        recPaused = false;
+        startTimer();
+        break;
+      case 'deviceList':
+        recDeviceSel.innerHTML = msg.devices.length
+          ? msg.devices.map(d => '<option value="' + d.name + '">' + d.name + '</option>').join('')
+          : '<option value="">No devices found</option>';
+        break;
+      case 'recordingPaused':
+        stopTimer();
+        recPaused = true;
+        recState.textContent = 'Paused';
+        recHint.textContent = 'Press Resume to continue';
+        recPauseBtn.textContent = '▶ Resume';
+        recPanel.classList.add('paused');
+        break;
+      case 'recordingResumed':
+        startTimer();
+        recPaused = false;
+        recState.textContent = 'Recording';
+        recHint.textContent = 'Speak now — press Save when done';
+        recPauseBtn.textContent = '⏸ Pause';
+        recPanel.classList.remove('paused');
+        break;
+      case 'recordingError':
+        stopTimer();
+        recState.textContent = 'Error';
+        recHint.textContent = msg.message;
+        recTimer.textContent = '';
+        recPanel.classList.add('error');
+        recPauseBtn.disabled = true;
+        recStopBtn.disabled = true;
+        break;
+      case 'audioSaved':
+        hideRecPanel();
+        if (!notesCache[msg.hash]) { notesCache[msg.hash] = {}; }
+        if (!notesCache[msg.hash].audios) { notesCache[msg.hash].audios = []; }
+        notesCache[msg.hash].audios.push({ name: msg.audioName, uri: msg.webviewUri });
+        renderCommits();
+        break;
       case 'error':
         commitList.innerHTML = '<div class="error-msg">' + escHtml(msg.message) + '</div>';
         break;
     }
   });
 
-  // syncNotes: extension now always sends {name,uri} objects so we just merge
+  // syncNotes: extension sends {name,uri} objects for images and audios
   function syncNotes(commits) {
     commits.forEach(c => {
       if (!c.note) { return; }
-      // Merge: keep any images already enriched from imageAttached events
       const existing = notesCache[c.hash];
       notesCache[c.hash] = {
         ...c.note,
         images: c.note.images && c.note.images.length
-          ? c.note.images   // extension sends {name,uri} objects now
-          : existing?.images ?? []
+          ? c.note.images
+          : existing?.images ?? [],
+        audios: c.note.audios && c.note.audios.length
+          ? c.note.audios
+          : existing?.audios ?? []
       };
     });
   }
@@ -963,20 +1525,63 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     el.dataset.hash = hash;
     if (note?.color) { el.style.borderLeftColor = note.color; }
 
+    const images = note?.images || [];
+    const audios = note?.audios || [];
+    const badgeStyle = note?.color ? ' style="background:' + note.color + '"' : '';
+    const imgBadge = images.length
+      ? '<span class="img-badge"' + badgeStyle + ' title="' + images.length + ' image' + (images.length > 1 ? 's' : '') + ' — click to toggle">' + images.length + '</span>'
+      : '';
+    const audBadge = audios.length
+      ? '<span class="aud-badge"' + badgeStyle + ' title="' + audios.length + ' recording' + (audios.length > 1 ? 's' : '') + ' — click to play">🎙' + audios.length + '</span>'
+      : '';
+
     el.innerHTML =
       '<div class="commit-top">' +
         '<span class="chevron">&#9654;</span>' +
         '<span class="select-badge">' + (selIdx >= 0 ? selIdx + 1 : '') + '</span>' +
         '<span class="commit-hash">' + escHtml(commit.shortHash) + '</span>' +
         '<span class="commit-msg">' + escHtml(commit.message) + '</span>' +
-      '</div>' +
-      '<div class="commit-meta">' +
-        '<span class="commit-sub">' + escHtml(commit.date) + ' · ' + escHtml(commit.author) + '</span>' +
+        imgBadge + audBadge +
       '</div>';
 
-    // Images strip
-    const images = note?.images;
-    if (images && images.length) {
+    // Image badge toggle
+    if (images.length) {
+      el.querySelector('.img-badge').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (imagesOpen.has(hash)) { imagesOpen.delete(hash); }
+        else { imagesOpen.add(hash); }
+        renderCommits();
+      });
+    }
+
+    // Audio badge toggle
+    if (audios.length) {
+      el.querySelector('.aud-badge').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (audiosOpen.has(hash)) { audiosOpen.delete(hash); }
+        else { audiosOpen.add(hash); }
+        renderCommits();
+      });
+    }
+
+    // Audio player (only when badge is toggled open)
+    if (audios.length && audiosOpen.has(hash)) {
+      const playerSection = document.createElement('div');
+      playerSection.className = 'audio-player';
+      audios.forEach(aud => {
+        const uri  = typeof aud === 'string' ? aud : aud.uri;
+        const name = typeof aud === 'string' ? aud : aud.name;
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.src = uri;
+        audio.title = name;
+        playerSection.appendChild(audio);
+      });
+      el.appendChild(playerSection);
+    }
+
+    // Images strip (only when badge is toggled open)
+    if (images.length && imagesOpen.has(hash)) {
       const strip = document.createElement('div');
       strip.className = 'images-strip';
       images.forEach(img => {
@@ -1028,11 +1633,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       else { toggleExpand(hash); }
     });
 
-    // Right-click: context menu
+    // Right-click: context menu (pass date so it shows in the menu)
     el.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      openCtxMenu(hash, e.clientX, e.clientY);
+      openCtxMenu(hash, e.clientX, e.clientY, commit.date);
     });
 
     return el;

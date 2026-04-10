@@ -15,6 +15,7 @@ export interface FileChange {
 export interface CommitNote {
     color?: string;
     images?: string[]; // filenames inside .vscode/git-notes/images/
+    audios?: string[]; // filenames inside .vscode/git-notes/audio/
 }
 
 export interface NotesData {
