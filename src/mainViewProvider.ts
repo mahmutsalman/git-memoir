@@ -124,13 +124,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                             vscode.Uri.file(path.join(imagesDir, filename))
                         ).toString()
                     })) : (c.note?.images ?? []),
-                    audios: hasAudios ? c.note.audios.map((entry: import('./types').AudioEntry) => ({
-                        name: entry.fileName,
-                        filePath: entry.filePath,
-                        uri: webview.asWebviewUri(
-                            vscode.Uri.file(path.join(audiosDir, entry.fileName))
-                        ).toString()
-                    })) : (c.note?.audios ?? [])
+                    audios: hasAudios ? c.note.audios
+                        .filter((entry: import('./types').AudioEntry) => !!entry?.fileName)
+                        .map((entry: import('./types').AudioEntry) => ({
+                            name: entry.fileName,
+                            filePath: entry.filePath,
+                            uri: webview.asWebviewUri(
+                                vscode.Uri.file(path.join(audiosDir, entry.fileName))
+                            ).toString()
+                        })) : (c.note?.audios ?? [])
                 }
             };
         });
@@ -608,7 +610,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     overflow-x: hidden;
   }
 
-  /* ── Status / empty ── */
+  /* ── Status / empty / error ── */
   .status-msg {
     padding: 24px 12px;
     color: var(--vscode-descriptionForeground);
@@ -616,9 +618,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     text-align: center;
   }
   .error-msg {
-    padding: 12px;
-    color: var(--vscode-errorForeground);
-    font-size: 12px;
+    padding: 24px 12px;
+    color: #e05252;
+    font-size: 11px;
+    text-align: center;
+    white-space: pre-wrap;
+    word-break: break-all;
   }
 
   /* ── Commit card ── */
@@ -1002,8 +1007,21 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     flex: 1;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
     min-width: 0;
+  }
+  .ap-entry {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ap-date {
+    font-size: 10px;
+    color: var(--vscode-foreground, #ccc);
+    opacity: 0.6;
+    font-family: var(--vscode-editor-font-family, monospace);
+    padding: 1px 10px 3px;
+    display: block;
   }
   .ap-progress {
     -webkit-appearance: none;
@@ -1317,6 +1335,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   let showAllAudios = false;   // when true, file tab shows recordings from all files
   const speedSteps = [0.5, 0.75, 1, 1.25, 1.5, 2];
   let playbackSpeed = 1.5;     // global playback speed applied to all audio players
+  const audioRegistry = {};   // audioName → HTMLAudioElement  (persists across re-renders)
 
   // ── Recording state ──────────────────────────────────────────────────────────
   let recHash = null;
@@ -1382,7 +1401,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const idx = (speedSteps.indexOf(playbackSpeed) + 1) % speedSteps.length;
     playbackSpeed = speedSteps[idx];
     speedBtn.textContent = playbackSpeed + '×';
-    document.querySelectorAll('audio').forEach(a => { a.playbackRate = playbackSpeed; });
+    Object.values(audioRegistry).forEach(a => { a.playbackRate = playbackSpeed; });
   });
 
   // ── Compare bar ───────────────────────────────────────────────────────────────
@@ -1773,9 +1792,23 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       playerSection.className = 'audio-player';
       visibleAudios.forEach((aud, idx) => {
         const uri = typeof aud === 'string' ? aud : aud.uri;
+        const audioName = typeof aud === 'string' ? aud : aud.name;
 
-        // Hidden audio element — driven by custom UI
-        const audio = new Audio(uri);
+        // Reuse existing Audio element from registry (preserves playback state)
+        let audio = audioRegistry[audioName];
+        if (!audio) {
+          audio = new Audio(uri);
+          audio.playbackRate = playbackSpeed;
+          audioRegistry[audioName] = audio;
+        }
+
+        // AbortController so we can remove stale listeners on re-render
+        const ac = new AbortController();
+        const sig = { signal: ac.signal };
+
+        // Entry wrapper (row + date below)
+        const entry = document.createElement('div');
+        entry.className = 'ap-entry';
 
         // Row
         const row = document.createElement('div');
@@ -1787,7 +1820,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         playBtn.title = 'Play / Pause';
         const iconPlay = '<svg width="9" height="10" viewBox="0 0 9 10" fill="white"><polygon points="0,0 9,5 0,10"/></svg>';
         const iconPause = '<svg width="9" height="10" viewBox="0 0 9 10" fill="white"><rect x="0" y="0" width="3" height="10"/><rect x="6" y="0" width="3" height="10"/></svg>';
-        playBtn.innerHTML = iconPlay;
+        // Sync icon to actual play state
+        playBtn.innerHTML = audio.paused ? iconPlay : iconPause;
 
         // Track + progress
         const track = document.createElement('div');
@@ -1797,16 +1831,16 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         progress.type = 'range';
         progress.className = 'ap-progress';
         progress.min = '0';
-        progress.max = '100';
-        progress.value = '0';
+        progress.max = isFinite(audio.duration) ? String(audio.duration) : '100';
         progress.step = '0.1';
+        // Sync position to current playback state
+        progress.value = String(audio.currentTime);
 
         track.appendChild(progress);
 
         // Time display
         const timeEl = document.createElement('span');
         timeEl.className = 'ap-time';
-        timeEl.textContent = '0:00 / –:––';
 
         const fmt = (s) => {
           if (!isFinite(s)) { return '–:––'; }
@@ -1814,21 +1848,27 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
           return m + ':' + String(Math.floor(s % 60)).padStart(2, '0');
         };
 
+        // Sync time display to current state
+        timeEl.textContent = fmt(audio.currentTime) + ' / ' + fmt(audio.duration);
+
         audio.addEventListener('loadedmetadata', () => {
-          timeEl.textContent = '0:00 / ' + fmt(audio.duration);
+          timeEl.textContent = fmt(audio.currentTime) + ' / ' + fmt(audio.duration);
           progress.max = String(audio.duration);
-        });
+        }, sig);
         audio.addEventListener('timeupdate', () => {
           if (!progress.matches(':active')) {
             progress.value = String(audio.currentTime);
           }
           timeEl.textContent = fmt(audio.currentTime) + ' / ' + fmt(audio.duration);
-        });
+        }, sig);
         audio.addEventListener('ended', () => {
           playBtn.innerHTML = iconPlay;
           progress.value = '0';
           timeEl.textContent = '0:00 / ' + fmt(audio.duration);
-        });
+        }, sig);
+
+        // Abort stale listeners when this element is removed from DOM
+        entry.addEventListener('disconnected', () => ac.abort(), { once: true });
 
         playBtn.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -1837,7 +1877,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             playerSection.querySelectorAll('.ap-play').forEach((btn, i) => {
               if (i !== idx) { btn.innerHTML = iconPlay; }
             });
-            document.querySelectorAll('audio').forEach(a => a.pause());
+            Object.values(audioRegistry).forEach(a => { if (a !== audio) { a.pause(); } });
             audio.play();
             playBtn.innerHTML = iconPause;
           } else {
@@ -1851,11 +1891,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
           audio.currentTime = Number(progress.value);
         });
 
-        // Apply global playback speed
-        audio.playbackRate = playbackSpeed;
-
         // Delete button
-        const audioName = typeof aud === 'string' ? aud : aud.name;
         const delBtn = document.createElement('button');
         delBtn.className = 'ap-del';
         delBtn.title = 'Remove recording';
@@ -1863,6 +1899,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         delBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           audio.pause();
+          ac.abort(); // remove stale listeners immediately
+          delete audioRegistry[audioName];
           if (notesCache[hash]?.audios) {
             notesCache[hash].audios = notesCache[hash].audios.filter(a => (typeof a === 'string' ? a : a.name) !== audioName);
           }
@@ -1874,7 +1912,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         row.appendChild(track);
         row.appendChild(timeEl);
         row.appendChild(delBtn);
-        playerSection.appendChild(row);
+        entry.appendChild(row);
+
+        // TODO: show creation date below each player row (parsed from filename timestamp).
+        // The date element is created correctly but stays invisible — some ancestor has
+        // overflow:hidden that clips anything outside the .ap-row height.  Needs investigation.
+        // const tsMatch = audioName.match(/-(\d{10,13})\./);
+        // if (tsMatch) { ... append .ap-date div to entry ... }
+
+        playerSection.appendChild(entry);
       });
       el.appendChild(playerSection);
     }
