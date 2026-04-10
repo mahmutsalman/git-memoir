@@ -547,6 +547,55 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   }
   #fileTabLabel { font-style: italic; }
 
+  /* ── File tab toolbar (auto-open toggle) ── */
+  .file-toolbar {
+    display: none;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    flex-shrink: 0;
+    background: var(--vscode-sideBar-background);
+  }
+  .file-toolbar.visible { display: flex; }
+  .toggle-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
+    user-select: none;
+    flex: 1;
+  }
+  .toggle-switch {
+    position: relative;
+    width: 28px;
+    height: 15px;
+    flex-shrink: 0;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .toggle-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 8px;
+    background: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.3));
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .toggle-track::after {
+    content: '';
+    position: absolute;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: #fff;
+    top: 2px;
+    left: 2px;
+    transition: transform 0.2s;
+  }
+  .toggle-switch input:checked + .toggle-track { background: #2472c8; }
+  .toggle-switch input:checked + .toggle-track::after { transform: translateX(13px); }
+
   /* ── Scrollable list area ── */
   .list-area {
     flex: 1;
@@ -1133,6 +1182,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   <button class="tab active" id="tabAll">All Commits</button>
   <button class="tab" id="tabFile"><span id="fileTabLabel">Current File</span></button>
 </div>
+<div class="file-toolbar" id="fileToolbar">
+  <span class="toggle-label">Expand commits</span>
+  <label class="toggle-switch">
+    <input type="checkbox" id="autoOpenToggle">
+    <span class="toggle-track"></span>
+  </label>
+</div>
 
 <!-- ── Main commit list view ── -->
 <div class="view active" id="viewMain">
@@ -1230,6 +1286,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   let audiosOpen = new Set();  // hashes with audio player expanded
   let currentFilePath = null;  // relative path of the file shown in file tab
   let pendingAutoOpen = null;  // hash waiting for files to load before auto-opening diff
+  let autoOpenDiff = false;    // controlled by the toggle in file tab toolbar
 
   // ── Recording state ──────────────────────────────────────────────────────────
   let recHash = null;
@@ -1238,9 +1295,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   let recSeconds = 0;
 
   // ── DOM refs ─────────────────────────────────────────────────────────────────
-  const tabAll     = document.getElementById('tabAll');
-  const tabFile    = document.getElementById('tabFile');
+  const tabAll       = document.getElementById('tabAll');
+  const tabFile      = document.getElementById('tabFile');
   const fileTabLabel = document.getElementById('fileTabLabel');
+  const fileToolbar  = document.getElementById('fileToolbar');
+  const autoOpenToggle = document.getElementById('autoOpenToggle');
   const viewMain   = document.getElementById('viewMain');
   const viewCompare = document.getElementById('viewCompare');
   const commitList = document.getElementById('commitList');
@@ -1275,7 +1334,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   function renderTabs() {
     tabAll.classList.toggle('active', activeTab === 'all');
     tabFile.classList.toggle('active', activeTab === 'file');
+    fileToolbar.classList.toggle('visible', activeTab === 'file');
   }
+
+  autoOpenToggle.addEventListener('change', () => {
+    autoOpenDiff = autoOpenToggle.checked;
+  });
 
   // ── Compare bar ───────────────────────────────────────────────────────────────
   compareBtn.addEventListener('click', () => {
@@ -1829,6 +1893,20 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   }
 
   function toggleExpand(hash) {
+    if (activeTab === 'file') {
+      // Always open the diff for the current file
+      if (currentFilePath) {
+        if (!filesCache[hash] && !loadingFiles.has(hash)) {
+          loadingFiles.add(hash);
+          vscode.postMessage({ type: 'getCommitFiles', hash });
+          pendingAutoOpen = hash;
+        } else {
+          autoOpenFileDiff(hash);
+        }
+      }
+      // Expansion (changed files list) only when toggle is on
+      if (!autoOpenDiff) { return; }
+    }
     if (expanded.has(hash)) { expanded.delete(hash); }
     else {
       expanded.clear();
@@ -1836,11 +1914,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       if (!filesCache[hash] && !loadingFiles.has(hash)) {
         loadingFiles.add(hash);
         vscode.postMessage({ type: 'getCommitFiles', hash });
-        // Files not yet loaded — fire diff once they arrive
-        if (activeTab === 'file' && currentFilePath) { pendingAutoOpen = hash; }
-      } else if (activeTab === 'file' && currentFilePath) {
-        // Files already cached — open diff immediately
-        autoOpenFileDiff(hash);
       }
     }
     renderCommits();
